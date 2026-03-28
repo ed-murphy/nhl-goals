@@ -18,6 +18,7 @@ PRIOR_GAMES <- 8
 MAX_GOALS_PROB <- 15
 MIN_TEAM_GAMES_FOR_MODEL <- 20
 CACHING_DAYS <- 90
+MIN_EDGE_FOR_PICK <- 0.03
 SCHEDULE_INITIAL_LOOKAHEAD_DAYS <- 7
 SCHEDULE_MAX_LOOKAHEAD_DAYS <- 45
 SCHEDULE_LOOKAHEAD_STEP_DAYS <- 7
@@ -128,6 +129,15 @@ extract_games_from_json <- function(js) {
   events_list <- purrr::transpose(events)
 
   map_dfr(events_list, function(game) {
+    status_obj <- game$status
+    completed <- FALSE
+    if (is.list(status_obj) && !is.data.frame(status_obj) && !is.null(status_obj$type)) {
+      completed <- as.logical(status_obj$type$completed %||% FALSE)
+    } else if (is.data.frame(status_obj)) {
+      completed <- as.logical(status_obj[["type.completed"]] %||% status_obj[["completed"]] %||% FALSE)
+    }
+    if (is.na(completed)) completed <- FALSE
+
     if (is.null(game$competitions) || length(game$competitions) == 0) return(NULL)
     comp <- game$competitions[1, ]
     if (is.null(comp$competitors) || length(comp$competitors) == 0) return(NULL)
@@ -140,10 +150,20 @@ extract_games_from_json <- function(js) {
     away_team_name <- away$team$displayName %||% NA
     home_score <- suppressWarnings(as.numeric(home$score %||% NA))
     away_score <- suppressWarnings(as.numeric(away$score %||% NA))
+    game_date <- as.Date(substr(game$date %||% NA, 1, 10))
+
+    # Historical model should only train on completed games.
+    # If completion status is unavailable, keep only clearly finished past games with real scores.
+    if (!isTRUE(completed)) {
+      has_scores <- is.finite(home_score) && is.finite(away_score)
+      is_past_date <- !is.na(game_date) && game_date < Sys.Date()
+      plausible_final <- has_scores && (home_score + away_score) > 0
+      if (!(is_past_date && plausible_final)) return(NULL)
+    }
 
     data.frame(
       game_id = game$id %||% NA,
-      date = as.Date(substr(game$date %||% NA, 1, 10)),
+      date = game_date,
       home_team = home_team_name,
       away_team = away_team_name,
       home_goals = home_score,
@@ -440,7 +460,7 @@ fetch_total_from_odds_api <- function(home_team, away_team, game_date, return_me
       return(stats::median(half_quotes$point))
     }
 
-    # If only integer points exist, infer nearest .5 line from implied over/under balance.
+    # If only integer points exist, keep the integer total closest to fair pricing.
     point_summary <- quotes_df %>%
       dplyr::mutate(implied_prob = vapply(price, american_to_prob, numeric(1))) %>%
       dplyr::filter(is.finite(implied_prob)) %>%
@@ -468,12 +488,8 @@ fetch_total_from_odds_api <- function(home_team, away_team, game_date, return_me
 
     best <- point_summary[1, ]
     base_point <- as.numeric(best$point)
-    over_prob <- as.numeric(best$over_prob_fair)
-    if (!is.finite(base_point) || !is.finite(over_prob)) return(NA_real_)
-
-    half_line <- ifelse(over_prob >= 0.5, base_point + 0.5, base_point - 0.5)
-    half_line <- pmin(pmax(half_line, 2.5), 14.5)
-    half_line
+    if (!is.finite(base_point)) return(NA_real_)
+    pmin(pmax(base_point, 2), 15)
   }
 
   pick_book_total <- function(quotes_df) {
@@ -1042,13 +1058,13 @@ run_ou_prediction <- function(home_team, away_team, vegas_total, filtered_data, 
     theta = lambdas$theta
   )
 
+  edge_strength <- abs(probabilities$prob_over - probabilities$prob_under)
   lean <- dplyr::case_when(
+    edge_strength < MIN_EDGE_FOR_PICK ~ "NO EDGE",
     probabilities$prob_over > probabilities$prob_under ~ "OVER",
     probabilities$prob_under > probabilities$prob_over ~ "UNDER",
     TRUE ~ "NO EDGE"
   )
-
-  edge_strength <- abs(probabilities$prob_over - probabilities$prob_under)
   matchup <- paste(away_team, "at", home_team)
   prediction_label <- ifelse(lean == "NO EDGE", "NO EDGE", paste(lean, vegas_total))
 
