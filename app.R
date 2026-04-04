@@ -13,12 +13,14 @@ library(lubridate)
 # MODEL SETTINGS
 # ======================================================================
 
-RECENCY_HALFLIFE_DAYS <- 14
+RECENCY_HALFLIFE_DAYS <- 21
 PRIOR_GAMES <- 8
 MAX_GOALS_PROB <- 15
 MIN_TEAM_GAMES_FOR_MODEL <- 20
 CACHING_DAYS <- 90
 MIN_EDGE_FOR_PICK <- 0.03
+MAX_NB_BLEND_WEIGHT <- 0.70
+HISTORY_DAYS <- 90
 SCHEDULE_INITIAL_LOOKAHEAD_DAYS <- 7
 SCHEDULE_MAX_LOOKAHEAD_DAYS <- 45
 SCHEDULE_LOOKAHEAD_STEP_DAYS <- 7
@@ -120,28 +122,51 @@ extract_vegas_total_from_comp <- function(comp) {
   NA_real_
 }
 
+resolve_events_frame <- function(obj) {
+  if (is.data.frame(obj) && "id" %in% names(obj)) {
+    return(obj)
+  }
+  if (is.list(obj) && !is.data.frame(obj) && !is.null(obj$events)) {
+    return(resolve_events_frame(obj$events))
+  }
+  if (is.list(obj) && !is.data.frame(obj)) {
+    # Assume it's a list of event objects, transpose to get data.frame
+    transposed <- purrr::transpose(obj)
+    df <- as.data.frame(transposed, stringsAsFactors = FALSE)
+    return(df)
+  }
+  NULL
+}
+
 extract_games_from_json <- function(js) {
-  events <- js$events
+  events <- resolve_events_frame(js$events) %||% resolve_events_frame(js)
   if (is.null(events) || !is.data.frame(events) || nrow(events) == 0) {
     return(NULL)
   }
 
-  events_list <- purrr::transpose(events)
-
-  map_dfr(events_list, function(game) {
-    status_obj <- game$status
-    completed <- FALSE
+  map_dfr(seq_len(nrow(events)), function(i) {
+    game <- events[i, , drop = FALSE]
+    status_obj <- game$status[[1]]
+    
+    completed_raw <- NULL
+    
     if (is.list(status_obj) && !is.data.frame(status_obj) && !is.null(status_obj$type)) {
-      completed <- as.logical(status_obj$type$completed %||% FALSE)
+      completed_raw <- status_obj$type$completed
     } else if (is.data.frame(status_obj)) {
-      completed <- as.logical(status_obj[["type.completed"]] %||% status_obj[["completed"]] %||% FALSE)
+      completed_raw <- status_obj[["type.completed"]] %||% status_obj[["completed"]]
     }
+    
+    completed <- completed_raw %||% FALSE
+    
+    completed <- as.logical(completed)[1]
+    
     if (is.na(completed)) completed <- FALSE
 
     if (is.null(game$competitions) || length(game$competitions) == 0) return(NULL)
-    comp <- game$competitions[1, ]
+    comp <- game$competitions[[1]]
     if (is.null(comp$competitors) || length(comp$competitors) == 0) return(NULL)
     competitors <- comp$competitors[[1]]
+    if (!is.data.frame(competitors)) return(NULL)
     home <- dplyr::filter(competitors, homeAway == "home")
     away <- dplyr::filter(competitors, homeAway == "away")
     if (nrow(home) != 1 || nrow(away) != 1) return(NULL)
@@ -150,7 +175,7 @@ extract_games_from_json <- function(js) {
     away_team_name <- away$team$displayName %||% NA
     home_score <- suppressWarnings(as.numeric(home$score %||% NA))
     away_score <- suppressWarnings(as.numeric(away$score %||% NA))
-    game_date <- as.Date(substr(game$date %||% NA, 1, 10))
+    game_date <- as.Date(substr(game$date[[1]] %||% NA, 1, 10))
 
     # Historical model should only train on completed games.
     # If completion status is unavailable, keep only clearly finished past games with real scores.
@@ -162,7 +187,7 @@ extract_games_from_json <- function(js) {
     }
 
     data.frame(
-      game_id = game$id %||% NA,
+      game_id = game$id[[1]] %||% NA,
       date = game_date,
       home_team = home_team_name,
       away_team = away_team_name,
@@ -174,12 +199,10 @@ extract_games_from_json <- function(js) {
 }
 
 extract_schedule_from_json <- function(js) {
-  events <- js$events
+  events <- resolve_events_frame(js$events) %||% resolve_events_frame(js)
   if (is.null(events) || !is.data.frame(events) || nrow(events) == 0) {
     return(NULL)
   }
-
-  events_list <- purrr::transpose(events)
 
   get_status_field <- function(status_obj, nested_name, flat_name, default = NA) {
     if (is.null(status_obj)) return(default)
@@ -204,16 +227,20 @@ extract_schedule_from_json <- function(js) {
     default
   }
 
-  map_dfr(events_list, function(game) {
+  map_dfr(seq_len(nrow(events)), function(i) {
+    game <- events[i, , drop = FALSE]
+
     if (is.null(game$competitions) || length(game$competitions) == 0) return(NULL)
-    comp <- game$competitions[1, ]
+    comp <- game$competitions[[1]]
     if (is.null(comp$competitors) || length(comp$competitors) == 0) return(NULL)
     competitors <- comp$competitors[[1]]
+    if (!is.data.frame(competitors)) return(NULL)
+
     home <- dplyr::filter(competitors, homeAway == "home")
     away <- dplyr::filter(competitors, homeAway == "away")
     if (nrow(home) != 1 || nrow(away) != 1) return(NULL)
 
-    start_utc <- parse_espn_datetime(game$date %||% NA)
+    start_utc <- parse_espn_datetime(game$date[[1]] %||% NA)
     if (is.na(start_utc)) {
       start_local <- as.POSIXct(NA)
       game_date <- as.Date(NA)
@@ -222,20 +249,22 @@ extract_schedule_from_json <- function(js) {
       game_date <- as.Date(start_local)
     }
 
-    status_obj <- game$status
+    status_obj <- game$status[[1]]
     completed <- as.logical(get_status_field(status_obj, "completed", "type.completed", FALSE))
     if (is.na(completed)) completed <- FALSE
+
     state <- as.character(get_status_field(status_obj, "state", "type.state", NA_character_))
     status_text <- as.character(get_status_field(status_obj, "description", "type.description", NA_character_))
+
     vegas_total <- extract_vegas_total_from_comp(comp)
 
     data.frame(
-      game_id = game$id %||% NA,
+      game_id = game$id[[1]] %||% NA,
       game_date = game_date,
       start_time_utc = start_utc,
       start_time_local = start_local,
-      home_team = home$team$displayName %||% NA,
-      away_team = away$team$displayName %||% NA,
+      home_team = home$team$displayName[[1]] %||% NA,
+      away_team = away$team$displayName[[1]] %||% NA,
       completed = completed,
       state = state,
       status_text = status_text,
@@ -595,6 +624,8 @@ fetch_total_from_odds_api <- function(home_team, away_team, game_date, return_me
     result$reason <- "No matching event found in Odds API events endpoint."
     return(if (return_meta) result else result$total)
   }
+  
+  event_id <- as.character(event$id[[1]])
 
   fetch_event_quotes <- function(regions_value) {
     odds_resp <- api_get_json(
@@ -637,7 +668,6 @@ fetch_total_from_odds_api <- function(home_team, away_team, game_date, return_me
   }
 
   # 2) Pull odds for matched event. Try US first, then broaden regions.
-  event_id <- as.character(event$id[[1]])
   query_regions <- unique(c(primary_regions, fallback_regions))
   quotes <- data.frame()
   last_reason <- "no quotes"
@@ -694,10 +724,10 @@ generate_date_range <- function(start_date, end_date) {
 
 build_schedule_card_choices <- function(schedule_df) {
   if (is.null(schedule_df) || nrow(schedule_df) == 0) {
-    return(list(choice_names = list(), choice_values = character()))
+    return(character(0))
   }
 
-  choice_names <- purrr::map(seq_len(nrow(schedule_df)), function(i) {
+  labels <- purrr::map_chr(seq_len(nrow(schedule_df)), function(i) {
     row <- schedule_df[i, ]
     game_date <- if (!is.na(row$game_date)) {
       row$game_date
@@ -707,18 +737,10 @@ build_schedule_card_choices <- function(schedule_df) {
       as.Date(NA)
     }
     date_label <- if (!is.na(game_date)) format(game_date, "%m/%d/%Y") else "TBD"
-
-    tags$div(
-      class = "game-card",
-      tags$div(class = "game-card-date", date_label),
-      tags$div(class = "game-card-matchup", paste0(row$away_team, " at ", row$home_team))
-    )
+    paste0(date_label, " \u2014 ", row$away_team, " at ", row$home_team)
   })
 
-  list(
-    choice_names = choice_names,
-    choice_values = schedule_df$game_id
-  )
+  stats::setNames(schedule_df$game_id, labels)
 }
 
 empty_schedule_df <- function() {
@@ -837,6 +859,10 @@ build_stacked_games <- function(df) {
     )
 
   bind_rows(home_data, away_data) %>%
+    dplyr::mutate(
+      team = purrr::map_chr(team, normalize_team_name),
+      opponent = purrr::map_chr(opponent, normalize_team_name)
+    ) %>%
     dplyr::filter(
       !is.na(goals_scored),
       !is.na(goals_conceded),
@@ -847,31 +873,38 @@ build_stacked_games <- function(df) {
     )
 }
 
-compute_team_strengths <- function(stacked_df, prior_games = PRIOR_GAMES) {
+compute_team_strengths <- function(stacked_df, weights = NULL, prior_games = PRIOR_GAMES) {
   if (nrow(stacked_df) == 0) {
     stop("No completed games found to compute team strengths.")
   }
 
-  league_mu <- mean(stacked_df$goals_scored, na.rm = TRUE)
+  if (is.null(weights) || length(weights) != nrow(stacked_df)) {
+    weights <- rep(1, nrow(stacked_df))
+  }
+
+  league_mu <- stats::weighted.mean(stacked_df$goals_scored, w = weights, na.rm = TRUE)
   if (!is.finite(league_mu) || league_mu <= 0) league_mu <- 3
 
   team_stats <- stacked_df %>%
+    dplyr::mutate(.w = weights) %>%
     dplyr::group_by(team) %>%
     dplyr::summarise(
       games = n(),
-      goals_for = sum(goals_scored, na.rm = TRUE),
-      goals_against = sum(goals_conceded, na.rm = TRUE),
+      eff_games = sum(.w, na.rm = TRUE),
+      goals_for = sum(goals_scored * .w, na.rm = TRUE),
+      goals_against = sum(goals_conceded * .w, na.rm = TRUE),
       .groups = "drop"
     ) %>%
     dplyr::mutate(
-      smoothed_for = (goals_for + prior_games * league_mu) / (games + prior_games),
-      smoothed_against = (goals_against + prior_games * league_mu) / (games + prior_games),
+      smoothed_for = (goals_for + prior_games * league_mu) / (eff_games + prior_games),
+      smoothed_against = (goals_against + prior_games * league_mu) / (eff_games + prior_games),
       attack_ratio = smoothed_for / league_mu,
       defense_ratio = smoothed_against / league_mu
     )
 
-  home_mu <- mean(stacked_df$goals_scored[stacked_df$is_home], na.rm = TRUE)
-  away_mu <- mean(stacked_df$goals_scored[!stacked_df$is_home], na.rm = TRUE)
+  home_mask <- stacked_df$is_home
+  home_mu <- stats::weighted.mean(stacked_df$goals_scored[home_mask], w = weights[home_mask], na.rm = TRUE)
+  away_mu <- stats::weighted.mean(stacked_df$goals_scored[!home_mask], w = weights[!home_mask], na.rm = TRUE)
   home_adv <- ifelse(is.finite(away_mu) && away_mu > 0, home_mu / away_mu, 1)
   home_adv <- pmin(pmax(home_adv, 0.8), 1.25)
 
@@ -912,7 +945,7 @@ build_count_model <- function(df) {
   recency_weight <- 0.5^(days_ago / RECENCY_HALFLIFE_DAYS)
   recency_weight[!is.finite(recency_weight)] <- 1
 
-  strengths <- compute_team_strengths(stacked_df)
+  strengths <- compute_team_strengths(stacked_df, weights = recency_weight)
 
   nb_model <- tryCatch(
     MASS::glm.nb(
@@ -968,27 +1001,29 @@ predict_expected_goals <- function(model_obj, home_team, away_team) {
   nb_away <- NA_real_
 
   if (!is.null(model_obj$nb_model)) {
-    predict_df <- data.frame(
-      team = factor(c(home_team, away_team), levels = model_obj$nb_model$xlevels$team),
-      opponent = factor(c(away_team, home_team), levels = model_obj$nb_model$xlevels$opponent),
-      is_home = c(TRUE, FALSE)
-    )
+    if (home_team %in% model_obj$nb_model$xlevels$team && away_team %in% model_obj$nb_model$xlevels$opponent) {
+      predict_df <- data.frame(
+        team = factor(c(home_team, away_team), levels = model_obj$nb_model$xlevels$team),
+        opponent = factor(c(away_team, home_team), levels = model_obj$nb_model$xlevels$opponent),
+        is_home = c(TRUE, FALSE)
+      )
 
-    nb_lambda <- tryCatch(
-      predict(model_obj$nb_model, predict_df, type = "response"),
-      error = function(e) c(NA_real_, NA_real_)
-    )
+      nb_lambda <- tryCatch(
+        predict(model_obj$nb_model, predict_df, type = "response"),
+        error = function(e) c(NA_real_, NA_real_)
+      )
 
-    if (length(nb_lambda) == 2 && all(is.finite(nb_lambda)) && all(nb_lambda > 0)) {
-      use_nb <- TRUE
-      nb_home <- nb_lambda[1]
-      nb_away <- nb_lambda[2]
+      if (length(nb_lambda) == 2 && all(is.finite(nb_lambda)) && all(nb_lambda > 0)) {
+        use_nb <- TRUE
+        nb_home <- nb_lambda[1]
+        nb_away <- nb_lambda[2]
+      }
     }
   }
 
-  blend_weight <- ifelse(use_nb, baseline$reliability, 0)
-  home_lambda <- blend_weight * nb_home + (1 - blend_weight) * baseline$home_lambda
-  away_lambda <- blend_weight * nb_away + (1 - blend_weight) * baseline$away_lambda
+  blend_weight <- ifelse(use_nb, pmin(baseline$reliability, MAX_NB_BLEND_WEIGHT), 0)
+  home_lambda <- if (use_nb) blend_weight * nb_home + (1 - blend_weight) * baseline$home_lambda else baseline$home_lambda
+  away_lambda <- if (use_nb) blend_weight * nb_away + (1 - blend_weight) * baseline$away_lambda else baseline$away_lambda
 
   list(
     home_lambda = home_lambda,
@@ -1021,7 +1056,7 @@ calculate_over_under_prob <- function(home_lambda, away_lambda, vegas_total, the
   prob_under <- sum(prob_matrix[total_goals_matrix < vegas_total])
   prob_over <- sum(prob_matrix[total_goals_matrix > vegas_total])
   prob_push <- sum(prob_matrix[total_goals_matrix == vegas_total])
-  total_prob <- prob_under + prob_over + prob_push
+  total_prob <- max(prob_under + prob_over + prob_push, 1e-12)
 
   list(
     prob_under = prob_under / total_prob,
@@ -1036,7 +1071,7 @@ calculate_over_under_prob <- function(home_lambda, away_lambda, vegas_total, the
 # PART 3: MASTER WRAPPER FUNCTION
 # ======================================================================
 
-run_ou_prediction <- function(home_team, away_team, vegas_total, filtered_data, line_source = "Unknown") {
+run_ou_prediction <- function(home_team, away_team, vegas_total, filtered_data, line_source = "Unknown", home_team_display = home_team, away_team_display = away_team) {
   if (is.null(filtered_data) || nrow(filtered_data) < 10) {
     stop(
       paste(
@@ -1047,7 +1082,7 @@ run_ou_prediction <- function(home_team, away_team, vegas_total, filtered_data, 
     )
   }
 
-  message("Training recency-weighted model...")
+  message(paste("Training model for", away_team, "at", home_team))
   nhl_model <- build_count_model(filtered_data)
   lambdas <- predict_expected_goals(nhl_model, home_team, away_team)
 
@@ -1065,7 +1100,7 @@ run_ou_prediction <- function(home_team, away_team, vegas_total, filtered_data, 
     probabilities$prob_under > probabilities$prob_over ~ "UNDER",
     TRUE ~ "NO EDGE"
   )
-  matchup <- paste(away_team, "at", home_team)
+  matchup <- paste(away_team_display, "at", home_team_display)
   prediction_label <- ifelse(lean == "NO EDGE", "NO EDGE", paste(lean, vegas_total))
 
   details_df <- data.frame(
@@ -1128,76 +1163,16 @@ run_ou_prediction <- function(home_team, away_team, vegas_total, filtered_data, 
 ui <- fluidPage(
   tags$head(
     tags$style(HTML("
-      #game_id.shiny-options-group {
-        display: grid !important;
-        grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
-        gap: 12px;
-      }
-      @media (max-width: 1200px) {
-        #game_id.shiny-options-group {
-          grid-template-columns: repeat(2, minmax(0, 1fr));
-        }
-      }
-      @media (max-width: 820px) {
-        #game_id.shiny-options-group {
-          grid-template-columns: repeat(1, minmax(0, 1fr));
-        }
-      }
-      #game_id.shiny-options-group .radio {
-        margin: 0 0 8px 0;
-        padding: 0;
-      }
-      #game_id.shiny-options-group .radio input[type='radio'] {
-        position: absolute;
-        opacity: 0;
-      }
-      #game_id.shiny-options-group .radio label {
-        display: block !important;
-        margin: 0 !important;
-        padding: 0 !important;
-        width: 100% !important;
-      }
-      #game_id.shiny-options-group .radio .game-card {
-        border: 1px solid #d0d7de;
-        border-radius: 8px;
-        background: #ffffff;
-        padding: 14px 16px;
-        cursor: pointer;
-        height: 100%;
-        transition: background-color 120ms ease, border-color 120ms ease, box-shadow 120ms ease;
-      }
-      #game_id.shiny-options-group .radio input[type='radio']:checked + .game-card,
-      #game_id.shiny-options-group .radio input[type='radio']:checked ~ .game-card,
-      #game_id.shiny-options-group .radio:has(input[type='radio']:checked) .game-card {
-        border-color: #1f77b4;
-        box-shadow: 0 0 0 3px rgba(31, 119, 180, 0.16);
-        background: #eaf4ff;
-      }
-      #game_id.shiny-options-group .game-card-date {
-        font-size: 12px;
-        color: #57606a;
-        margin-bottom: 4px;
-      }
-      #game_id.shiny-options-group .game-card-matchup {
-        font-size: 15px;
-        font-weight: 600;
-        color: #1f2328;
-      }
+      #game_id { font-size: 14px; }
     "))
   ),
   titlePanel("NHL Over/Under Prediction Model"),
   sidebarLayout(
     sidebarPanel(
-      radioButtons(
-        "history_days",
-        "Historical Data Window:",
-        choices = c("Last 15 Days" = 15, "Last 30 Days" = 30, "Last 60 Days" = 60, "Last 90 Days" = 90),
-        selected = 60
-      ),
-      hr(),
       p(
         tags$b("Technical Note:"),
-        "Predictions blend a recency-weighted negative binomial model with smoothed team attack/defense rates."
+        "Predictions blend a recency-weighted negative binomial model with smoothed team attack/defense rates.",
+        paste0("The model trains on the last ", HISTORY_DAYS, " days of game results.")
       ),
       hr(),
       p(
@@ -1232,13 +1207,13 @@ ui <- fluidPage(
       tableOutput("prediction_table"),
       hr(),
       h3("Select Upcoming Game"),
-      if (length(SCHEDULE_CARD_CHOICES$choice_values) > 0) {
-        radioButtons(
+      if (length(SCHEDULE_CARD_CHOICES) > 0) {
+        selectInput(
           "game_id",
           label = NULL,
-          choiceNames = SCHEDULE_CARD_CHOICES$choice_names,
-          choiceValues = SCHEDULE_CARD_CHOICES$choice_values,
-          selected = DEFAULT_GAME
+          choices = SCHEDULE_CARD_CHOICES,
+          selected = DEFAULT_GAME,
+          width = "100%"
         )
       } else {
         p("No upcoming scheduled games found in the current search window.")
@@ -1262,7 +1237,7 @@ server <- function(input, output, session) {
     )
   })
 
-  observeEvent(list(input$game_id, input$history_days), {
+  observeEvent(input$game_id, {
     details_visible(FALSE)
   }, ignoreInit = TRUE)
 
@@ -1276,26 +1251,32 @@ server <- function(input, output, session) {
   })
 
   model_results <- reactive({
-    req(input$game_id, input$history_days)
+    req(input$game_id)
 
     selected <- selected_game()
     if (is.null(selected) || nrow(selected) == 0) {
       return("ERROR: No scheduled game selected. The schedule feed may be empty for this window.")
     }
 
-    home_team <- selected$home_team[[1]]
-    away_team <- selected$away_team[[1]]
+    home_team_raw <- selected$home_team[[1]]
+    away_team_raw <- selected$away_team[[1]]
+    home_team <- normalize_team_name(home_team_raw)
+    away_team <- normalize_team_name(away_team_raw)
     if (is.na(home_team) || is.na(away_team) || home_team == "" || away_team == "") {
       return("ERROR: Selected game is missing team data.")
     }
 
     line_source <- "Unavailable"
-    odds_meta <- fetch_total_from_odds_api(
+    odds_meta <- isolate(fetch_total_from_odds_api(
       home_team = home_team,
       away_team = away_team,
-      game_date = selected$game_date[[1]],
+      game_date = if (!is.na(selected$game_date[[1]])) {
+        selected$game_date[[1]]
+      } else {
+        as.Date(selected$start_time_local[[1]])
+      },
       return_meta = TRUE
-    )
+    ))
     vegas_total <- odds_meta$total
     if (is.finite(vegas_total) && vegas_total >= 2 && vegas_total <= 15) {
       odds_book <- ""
@@ -1322,8 +1303,7 @@ server <- function(input, output, session) {
       )
     }
 
-    days_to_use <- as.numeric(input$history_days)
-    filter_date <- Sys.Date() - days_to_use + 1
+    filter_date <- Sys.Date() - HISTORY_DAYS + 1
 
     filtered_data <- CACHED_HISTORICAL_DATA %>%
       dplyr::filter(
@@ -1331,6 +1311,14 @@ server <- function(input, output, session) {
         !is.na(home_goals),
         !is.na(away_goals)
       )
+    
+    if (nrow(filtered_data) < MIN_TEAM_GAMES_FOR_MODEL) {
+      filtered_data <- CACHED_HISTORICAL_DATA %>%
+        dplyr::filter(
+          !is.na(home_goals),
+          !is.na(away_goals)
+        )
+    }
 
     withProgress(message = "Calculating...", detail = "Filtering data and training model.", value = 0.5, {
       result <- tryCatch(
@@ -1339,7 +1327,9 @@ server <- function(input, output, session) {
           away_team = away_team,
           vegas_total = vegas_total,
           filtered_data = filtered_data,
-          line_source = line_source
+          line_source = line_source,
+          home_team_display = home_team_raw,
+          away_team_display = away_team_raw
         ),
         error = function(e) as.character(e)
       )

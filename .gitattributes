@@ -1,4 +1,30 @@
-# Auto detect text files and perform LF normalization
-* text=auto
-/.gitattributes text eol=lf
+# Auto-detect text files and normalize to LF in repo
+* text=auto eol=lf
+
+# Explicitly enforce LF for code files
 *.R text eol=lf
+*.r text eol=lf
+*.Rmd text eol=lf
+*.py text eol=lf
+*.js text eol=lf
+*.ts text eol=lf
+*.html text eol=lf
+*.css text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.md text eol=lf
+
+# Windows-specific scripts can keep CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Binary files (never modify line endings)
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.pdf binary
+*.rds binary
+*.rda binary
