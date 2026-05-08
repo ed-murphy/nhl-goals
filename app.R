@@ -24,6 +24,8 @@ HISTORY_DAYS <- 90
 SCHEDULE_INITIAL_LOOKAHEAD_DAYS <- 7
 SCHEDULE_MAX_LOOKAHEAD_DAYS <- 45
 SCHEDULE_LOOKAHEAD_STEP_DAYS <- 7
+PREDICTION_LOG_PATH <- "prediction_log.csv"
+HISTORY_DISPLAY_COUNT <- 10
 
 # ======================================================================
 # PART 1: DATA SCRAPING & HELPERS
@@ -187,7 +189,7 @@ extract_games_from_json <- function(js) {
     }
 
     data.frame(
-      game_id = game$id[[1]] %||% NA,
+      game_id = as.character(game$id[[1]] %||% NA),
       date = game_date,
       home_team = home_team_name,
       away_team = away_team_name,
@@ -245,8 +247,8 @@ extract_schedule_from_json <- function(js) {
       start_local <- as.POSIXct(NA)
       game_date <- as.Date(NA)
     } else {
-      start_local <- with_tz(start_utc, tzone = Sys.timezone())
-      game_date <- as.Date(start_local)
+      start_local <- with_tz(start_utc, tzone = "America/New_York")
+      game_date <- as.Date(start_local, tz = "America/New_York")
     }
 
     status_obj <- game$status[[1]]
@@ -259,7 +261,7 @@ extract_schedule_from_json <- function(js) {
     vegas_total <- extract_vegas_total_from_comp(comp)
 
     data.frame(
-      game_id = game$id[[1]] %||% NA,
+      game_id = as.character(game$id[[1]] %||% NA),
       game_date = game_date,
       start_time_utc = start_utc,
       start_time_local = start_local,
@@ -381,8 +383,7 @@ fetch_game_vegas_total <- function(game_id, game_date) {
 normalize_team_name <- function(team_name) {
   if (is.null(team_name) || length(team_name) == 0 || is.na(team_name[[1]])) return(NA_character_)
   value <- as.character(team_name[[1]])
-  value <- iconv(value, to = "ASCII//TRANSLIT")
-  value <- tolower(gsub("[^a-z0-9]", "", value))
+  value <- tolower(gsub("[^a-zA-Z0-9]", "", value))
 
   # Unify known naming variants across feeds.
   if (value %in% c("utahhockeyclub", "utahmammoth")) value <- "utah"
@@ -620,11 +621,58 @@ fetch_total_from_odds_api <- function(home_team, away_team, game_date, return_me
     teams_match && date_match
   })
 
+  fetch_sport_quotes_by_team <- function(regions_value) {
+    sport_resp <- api_get_json(
+      "https://api.the-odds-api.com/v4/sports/icehockey_nhl/odds",
+      query = list(
+        apiKey = api_key,
+        regions = regions_value,
+        markets = "h2h,totals",
+        oddsFormat = "american",
+        dateFormat = "iso"
+      )
+    )
+    if (!sport_resp$ok || !is.list(sport_resp$body) || length(sport_resp$body) == 0) {
+      return(data.frame())
+    }
+    sport_event <- purrr::detect(sport_resp$body, function(evt) {
+      evt_home <- normalize_team_name(evt$home_team %||% NA_character_)
+      evt_away <- normalize_team_name(evt$away_team %||% NA_character_)
+      evt_time <- parse_espn_datetime(evt$commence_time %||% NA)
+      evt_date <- as.Date(evt_time)
+      teams_match <- (
+        identical(evt_home, target_home) && identical(evt_away, target_away)
+      ) || (
+        identical(evt_home, target_away) && identical(evt_away, target_home)
+      )
+      date_match <- !is.na(evt_date) && !is.na(target_date) && abs(as.numeric(evt_date - target_date)) <= 1
+      teams_match && date_match
+    })
+    if (is.null(sport_event)) return(data.frame())
+    extract_total_quotes_from_bookmakers(sport_event$bookmakers)
+  }
+
   if (is.null(event) || is.null(event$id) || length(event$id) == 0) {
-    result$reason <- "No matching event found in Odds API events endpoint."
+    # Event not in /events endpoint — try sport-level odds endpoint with team matching.
+    quotes <- data.frame()
+    for (reg in unique(c(primary_regions, fallback_regions))) {
+      sq <- fetch_sport_quotes_by_team(reg)
+      if (is.data.frame(sq) && nrow(sq) > 0) {
+        quotes <- sq
+        break
+      }
+    }
+    if (!is.data.frame(quotes) || nrow(quotes) == 0) {
+      result$reason <- "No matching event found in Odds API events or sport-level odds endpoints."
+      return(if (return_meta) result else result$total)
+    }
+    picked <- pick_book_total(quotes)
+    result$total <- picked$total
+    result$book  <- picked$book
+    result$reason <- "ok (sport-level fallback)"
     return(if (return_meta) result else result$total)
   }
-  
+
   event_id <- as.character(event$id[[1]])
 
   fetch_event_quotes <- function(regions_value) {
@@ -732,7 +780,7 @@ build_schedule_card_choices <- function(schedule_df) {
     game_date <- if (!is.na(row$game_date)) {
       row$game_date
     } else if (!is.na(row$start_time_local)) {
-      as.Date(row$start_time_local)
+      as.Date(row$start_time_local, tz = "America/New_York")
     } else {
       as.Date(NA)
     }
@@ -775,7 +823,7 @@ fetch_upcoming_schedule <- function(
 
     cat(paste("CACHING: Scraping NHL schedule from", start_date, "to", end_date, "\n"))
     schedule <- get_nhl_schedule_for_dates(dates) %>%
-      dplyr::mutate(game_date = dplyr::coalesce(game_date, as.Date(start_time_local))) %>%
+      dplyr::mutate(game_date = dplyr::coalesce(game_date, as.Date(start_time_local, tz = "America/New_York"))) %>%
       dplyr::filter(!completed, !is.na(game_date), game_date >= start_date) %>%
       dplyr::arrange(game_date, start_time_local)
 
@@ -1157,6 +1205,144 @@ run_ou_prediction <- function(home_team, away_team, vegas_total, filtered_data, 
 }
 
 # ======================================================================
+# PREDICTION LOG
+# ======================================================================
+
+empty_prediction_log <- function() {
+  data.frame(
+    game_id = character(),
+    game_date = as.Date(character()),
+    home_team = character(),
+    away_team = character(),
+    vegas_total = numeric(),
+    line_source = character(),
+    expected_total = numeric(),
+    prob_over = numeric(),
+    prob_under = numeric(),
+    lean = character(),
+    prediction_label = character(),
+    predicted_at = character(),
+    stringsAsFactors = FALSE
+  )
+}
+
+read_prediction_log <- function(path = PREDICTION_LOG_PATH) {
+  if (!file.exists(path)) return(empty_prediction_log())
+  tryCatch({
+    df <- read.csv(path, stringsAsFactors = FALSE)
+    df$game_date <- as.Date(df$game_date)
+    df
+  }, error = function(e) {
+    cat(paste("WARNING: Could not read prediction log:", conditionMessage(e), "\n"))
+    empty_prediction_log()
+  })
+}
+
+save_prediction_log <- function(log_df, path = PREDICTION_LOG_PATH) {
+  tryCatch(
+    write.csv(log_df, path, row.names = FALSE),
+    error = function(e) {
+      cat(paste("WARNING: Could not save prediction log:", conditionMessage(e), "\n"))
+    }
+  )
+}
+
+log_upcoming_predictions <- function(schedule_df, historical_data, path = PREDICTION_LOG_PATH) {
+  if (is.null(schedule_df) || nrow(schedule_df) == 0) return(invisible(NULL))
+  if (is.null(historical_data) || nrow(historical_data) == 0) return(invisible(NULL))
+
+  current_log <- read_prediction_log(path)
+
+  filter_date <- Sys.Date() - HISTORY_DAYS + 1
+  filtered_data <- historical_data %>%
+    dplyr::filter(date >= filter_date, !is.na(home_goals), !is.na(away_goals))
+  if (nrow(filtered_data) < MIN_TEAM_GAMES_FOR_MODEL) {
+    filtered_data <- historical_data %>%
+      dplyr::filter(!is.na(home_goals), !is.na(away_goals))
+  }
+
+  new_rows <- list()
+  for (i in seq_len(nrow(schedule_df))) {
+    game <- schedule_df[i, ]
+    game_id <- game$game_id[[1]]
+    if (game_id %in% current_log$game_id) next
+
+    home_team_raw <- game$home_team[[1]]
+    away_team_raw <- game$away_team[[1]]
+    home_team <- normalize_team_name(home_team_raw)
+    away_team <- normalize_team_name(away_team_raw)
+    if (is.na(home_team) || is.na(away_team) || home_team == "" || away_team == "") next
+
+    vegas_total <- suppressWarnings(as.numeric(game$vegas_total[[1]]))
+    line_source <- "ESPN (cached)"
+
+    if (!is.finite(vegas_total) || vegas_total < 2 || vegas_total > 15) {
+      cat(paste("LOGGING: No ESPN total for", away_team_raw, "at", home_team_raw, "- trying Odds API...\n"))
+      odds_meta <- tryCatch(
+        fetch_total_from_odds_api(home_team_raw, away_team_raw, game$game_date[[1]], return_meta = TRUE),
+        error = function(e) list(total = NA_real_, reason = conditionMessage(e), book = NA_character_)
+      )
+      vegas_total <- odds_meta$total
+      if (is.finite(vegas_total) && vegas_total >= 2 && vegas_total <= 15) {
+        line_source <- if (!is.null(odds_meta$book) && !is.na(odds_meta$book) && nzchar(odds_meta$book)) {
+          as.character(odds_meta$book)
+        } else {
+          "The Odds API"
+        }
+      }
+    }
+
+    if (!is.finite(vegas_total) || vegas_total < 2 || vegas_total > 15) {
+      cat(paste("LOGGING: Skipping", away_team_raw, "at", home_team_raw, "- no valid total available.\n"))
+      next
+    }
+
+    result <- tryCatch(
+      run_ou_prediction(
+        home_team = home_team,
+        away_team = away_team,
+        vegas_total = vegas_total,
+        filtered_data = filtered_data,
+        line_source = line_source,
+        home_team_display = home_team_raw,
+        away_team_display = away_team_raw
+      ),
+      error = function(e) NULL
+    )
+    if (is.null(result)) next
+
+    new_rows[[length(new_rows) + 1]] <- data.frame(
+      game_id = game_id,
+      game_date = game$game_date[[1]],
+      home_team = home_team_raw,
+      away_team = away_team_raw,
+      vegas_total = result$vegas_total,
+      line_source = result$line_source,
+      expected_total = result$expected_total,
+      prob_over = result$prob_over,
+      prob_under = result$prob_under,
+      lean = result$lean,
+      prediction_label = result$prediction_label,
+      predicted_at = as.character(Sys.time()),
+      stringsAsFactors = FALSE
+    )
+  }
+
+  if (length(new_rows) > 0) {
+    updated <- rbind(current_log, dplyr::bind_rows(new_rows))
+    save_prediction_log(updated, path)
+    cat(paste("LOGGING: Logged", length(new_rows), "new prediction(s) at startup.\n"))
+  } else {
+    cat("LOGGING: No new predictions to log at startup (all games already logged or no ESPN line available).\n")
+  }
+
+  invisible(NULL)
+}
+
+cat("LOGGING: Logging predictions for all upcoming games at startup...\n")
+log_upcoming_predictions(UPCOMING_SCHEDULE, CACHED_HISTORICAL_DATA)
+
+# ======================================================================
 # PART 4: SHINY APPLICATION UI AND SERVER
 # ======================================================================
 
@@ -1199,31 +1385,54 @@ ui <- fluidPage(
       )
     ),
     mainPanel(
-      h3("Over/Under Prediction"),
-      verbatimTextOutput("prediction_summary"),
-      actionButton("toggle_details", "See underlying statistics", class = "btn-default"),
-      br(),
-      br(),
-      tableOutput("prediction_table"),
-      hr(),
-      h3("Select Upcoming Game"),
-      if (length(SCHEDULE_CARD_CHOICES) > 0) {
-        selectInput(
-          "game_id",
-          label = NULL,
-          choices = SCHEDULE_CARD_CHOICES,
-          selected = DEFAULT_GAME,
-          width = "100%"
+      tabsetPanel(
+        tabPanel("Predictions",
+          h3("Over/Under Prediction"),
+          verbatimTextOutput("prediction_summary"),
+          actionButton("toggle_details", "See underlying statistics", class = "btn-default"),
+          br(),
+          br(),
+          tableOutput("prediction_table"),
+          hr(),
+          h3("Select Upcoming Game"),
+          uiOutput("game_selector_ui")
+        ),
+        tabPanel("History",
+          h3("Recent Prediction History"),
+          p("Predictions are stored as you use the app and compared against actual results once games complete."),
+          uiOutput("history_record"),
+          tableOutput("history_table")
         )
-      } else {
-        p("No upcoming scheduled games found in the current search window.")
-      }
+      )
     )
   )
 )
 
 server <- function(input, output, session) {
   details_visible <- reactiveVal(FALSE)
+  prediction_log <- reactiveVal(read_prediction_log())
+
+  available_games <- reactive({
+    invalidateLater(60000, session)
+    UPCOMING_SCHEDULE %>%
+      dplyr::filter(start_time_utc > Sys.time())
+  })
+
+  output$game_selector_ui <- renderUI({
+    games <- available_games()
+    choices <- build_schedule_card_choices(games)
+    if (length(choices) > 0) {
+      selectInput(
+        "game_id",
+        label = NULL,
+        choices = choices,
+        selected = choices[[1]],
+        width = "100%"
+      )
+    } else {
+      p("No upcoming games available in the current window.")
+    }
+  })
 
   observeEvent(input$toggle_details, {
     details_visible(!details_visible())
@@ -1273,7 +1482,7 @@ server <- function(input, output, session) {
       game_date = if (!is.na(selected$game_date[[1]])) {
         selected$game_date[[1]]
       } else {
-        as.Date(selected$start_time_local[[1]])
+        as.Date(selected$start_time_local[[1]], tz = "America/New_York")
       },
       return_meta = TRUE
     ))
@@ -1293,6 +1502,18 @@ server <- function(input, output, session) {
     if (!is.finite(vegas_total) || vegas_total < 2 || vegas_total > 15) {
       line_source <- "ESPN (live refresh)"
       vegas_total <- fetch_game_vegas_total(selected$game_id[[1]], selected$game_date[[1]])
+    }
+    if (!is.finite(vegas_total) || vegas_total < 2 || vegas_total > 15) {
+      log_row <- prediction_log() %>%
+        dplyr::filter(as.character(game_id) == as.character(selected$game_id[[1]])) %>%
+        dplyr::slice(1)
+      if (nrow(log_row) > 0) {
+        cached_total <- suppressWarnings(as.numeric(log_row$vegas_total[[1]]))
+        if (is.finite(cached_total) && cached_total >= 2 && cached_total <= 15) {
+          vegas_total <- cached_total
+          line_source <- paste0(log_row$line_source[[1]], " (cached)")
+        }
+      }
     }
     if (!is.finite(vegas_total) || vegas_total < 2 || vegas_total > 15) {
       return(
@@ -1339,6 +1560,51 @@ server <- function(input, output, session) {
     })
   })
 
+  # Log each prediction to disk; overwrite ESPN-only entries when a better line is available
+  observe({
+    res <- model_results()
+    if (!is.list(res) || is.null(res$lean)) return()
+
+    game <- selected_game()
+    if (is.null(game) || nrow(game) == 0) return()
+
+    current_log <- prediction_log()
+    game_id <- game$game_id[[1]]
+
+    existing_idx <- which(current_log$game_id == game_id)
+    already_logged <- length(existing_idx) > 0
+    espn_only_sources <- c("ESPN (cached)", "ESPN (live refresh)")
+    can_upgrade <- already_logged &&
+      current_log$line_source[existing_idx[1]] %in% espn_only_sources &&
+      !res$line_source %in% espn_only_sources
+    if (already_logged && !can_upgrade) return()
+
+    new_row <- data.frame(
+      game_id = game_id,
+      game_date = game$game_date[[1]],
+      home_team = game$home_team[[1]],
+      away_team = game$away_team[[1]],
+      vegas_total = res$vegas_total,
+      line_source = res$line_source,
+      expected_total = res$expected_total,
+      prob_over = res$prob_over,
+      prob_under = res$prob_under,
+      lean = res$lean,
+      prediction_label = res$prediction_label,
+      predicted_at = as.character(Sys.time()),
+      stringsAsFactors = FALSE
+    )
+
+    updated <- if (can_upgrade) {
+      current_log[existing_idx, ] <- new_row
+      current_log
+    } else {
+      rbind(current_log, new_row)
+    }
+    save_prediction_log(updated)
+    prediction_log(updated)
+  })
+
   output$prediction_summary <- renderPrint({
     res <- model_results()
 
@@ -1365,6 +1631,87 @@ server <- function(input, output, session) {
     if (is.character(res)) return(NULL)
     res$details
   }, striped = TRUE, bordered = TRUE, hover = TRUE)
+
+  history_data <- reactive({
+    log <- prediction_log()
+    if (nrow(log) == 0) return(NULL)
+
+    # Coerce game_id to character on both sides to avoid type-mismatch join errors
+    # (ESPN JSON sometimes delivers IDs as numeric, CSV always reads them back as character)
+    log$game_id <- as.character(log$game_id)
+    hist_lookup <- CACHED_HISTORICAL_DATA |>
+      dplyr::mutate(game_id = as.character(game_id)) |>
+      dplyr::select(game_id, home_goals, away_goals)
+
+    # Join stored predictions with actual results from completed games
+    history <- tryCatch(
+      log |>
+        dplyr::inner_join(hist_lookup, by = "game_id") |>
+        dplyr::arrange(dplyr::desc(game_date)) |>
+        head(HISTORY_DISPLAY_COUNT),
+      error = function(e) {
+        cat(paste("WARNING: history_data join failed:", conditionMessage(e), "\n"))
+        NULL
+      }
+    )
+    if (is.null(history)) return(NULL)
+
+    if (nrow(history) == 0) return(NULL)
+
+    history |>
+      dplyr::mutate(
+        actual_total = home_goals + away_goals,
+        actual_result = dplyr::case_when(
+          actual_total > vegas_total ~ "OVER",
+          actual_total < vegas_total ~ "UNDER",
+          TRUE ~ "PUSH"
+        ),
+        hit = dplyr::case_when(
+          lean == "NO EDGE" ~ "\u2014",
+          lean == actual_result ~ "\u2713",
+          actual_result == "PUSH" ~ "Push",
+          TRUE ~ "\u2717"
+        )
+      ) |>
+      dplyr::transmute(
+        Date = format(game_date, "%m/%d"),
+        Matchup = paste(away_team, "at", home_team),
+        Line = vegas_total,
+        Pick = prediction_label,
+        Expected = round(expected_total, 1),
+        Actual = as.integer(actual_total),
+        Result = actual_result,
+        Hit = hit
+      )
+  })
+
+  output$history_table <- renderTable({
+    history_data()
+  }, striped = TRUE, bordered = TRUE, hover = TRUE)
+
+  output$history_record <- renderUI({
+    hd <- history_data()
+    if (is.null(hd) || nrow(hd) == 0) {
+      return(p("No completed games with stored predictions yet. Predictions are logged as you use the app."))
+    }
+
+    picks <- hd |> dplyr::filter(Hit != "\u2014")
+    if (nrow(picks) == 0) {
+      return(p("Model had no picks with sufficient edge in completed games."))
+    }
+
+    wins <- sum(picks$Hit == "\u2713")
+    losses <- sum(picks$Hit == "\u2717")
+    pushes <- sum(picks$Hit == "Push")
+
+    record_text <- paste0(
+      wins, "-", losses,
+      if (pushes > 0) paste0("-", pushes) else "",
+      " on ", nrow(picks), " pick", if (nrow(picks) != 1) "s" else ""
+    )
+
+    tags$p(tags$b("Record: "), record_text)
+  })
 }
 
 shinyApp(ui = ui, server = server)

@@ -1,0 +1,6 @@
+"game_id","game_date","home_team","away_team","vegas_total","line_source","expected_total","prob_over","prob_under","lean","prediction_label","predicted_at"
+"401871425",2026-05-08,"Anaheim Ducks","Vegas Golden Knights",6.5,"FanDuel",5.98699471687141,0.391608114290731,0.608391885709269,"UNDER","UNDER 6.5","2026-05-08 15:35:25.77182"
+"401871413",2026-05-09,"Philadelphia Flyers","Carolina Hurricanes",5.5,"FanDuel",4.88217826918733,0.363375138979755,0.636624861020245,"UNDER","UNDER 5.5","2026-05-08 15:35:26.21028"
+"401871418",2026-05-09,"Minnesota Wild","Colorado Avalanche",6.5,"FanDuel",6.8601764687787,0.529252038915004,0.470747961084996,"OVER","OVER 6.5","2026-05-08 15:35:26.691589"
+"401871426",2026-05-10,"Anaheim Ducks","Vegas Golden Knights",6.5,"FanDuel",5.98699471687141,0.391608114290731,0.608391885709269,"UNDER","UNDER 6.5","2026-05-08 15:35:27.317562"
+"401871419",2026-05-11,"Minnesota Wild","Colorado Avalanche",6.5,"FanDuel",6.8601764687787,0.529252038915004,0.470747961084996,"OVER","OVER 6.5","2026-05-08 15:35:27.725783"
