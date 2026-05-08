@@ -24,6 +24,8 @@ HISTORY_DAYS <- 90
 SCHEDULE_INITIAL_LOOKAHEAD_DAYS <- 7
 SCHEDULE_MAX_LOOKAHEAD_DAYS <- 45
 SCHEDULE_LOOKAHEAD_STEP_DAYS <- 7
+PREDICTION_LOG_PATH <- "prediction_log.csv"
+HISTORY_DISPLAY_COUNT <- 10
 
 # ======================================================================
 # PART 1: DATA SCRAPING & HELPERS
@@ -1157,6 +1159,49 @@ run_ou_prediction <- function(home_team, away_team, vegas_total, filtered_data, 
 }
 
 # ======================================================================
+# PREDICTION LOG
+# ======================================================================
+
+empty_prediction_log <- function() {
+  data.frame(
+    game_id = character(),
+    game_date = as.Date(character()),
+    home_team = character(),
+    away_team = character(),
+    vegas_total = numeric(),
+    line_source = character(),
+    expected_total = numeric(),
+    prob_over = numeric(),
+    prob_under = numeric(),
+    lean = character(),
+    prediction_label = character(),
+    predicted_at = character(),
+    stringsAsFactors = FALSE
+  )
+}
+
+read_prediction_log <- function(path = PREDICTION_LOG_PATH) {
+  if (!file.exists(path)) return(empty_prediction_log())
+  tryCatch({
+    df <- read.csv(path, stringsAsFactors = FALSE)
+    df$game_date <- as.Date(df$game_date)
+    df
+  }, error = function(e) {
+    cat(paste("WARNING: Could not read prediction log:", conditionMessage(e), "\n"))
+    empty_prediction_log()
+  })
+}
+
+save_prediction_log <- function(log_df, path = PREDICTION_LOG_PATH) {
+  tryCatch(
+    write.csv(log_df, path, row.names = FALSE),
+    error = function(e) {
+      cat(paste("WARNING: Could not save prediction log:", conditionMessage(e), "\n"))
+    }
+  )
+}
+
+# ======================================================================
 # PART 4: SHINY APPLICATION UI AND SERVER
 # ======================================================================
 
@@ -1199,31 +1244,42 @@ ui <- fluidPage(
       )
     ),
     mainPanel(
-      h3("Over/Under Prediction"),
-      verbatimTextOutput("prediction_summary"),
-      actionButton("toggle_details", "See underlying statistics", class = "btn-default"),
-      br(),
-      br(),
-      tableOutput("prediction_table"),
-      hr(),
-      h3("Select Upcoming Game"),
-      if (length(SCHEDULE_CARD_CHOICES) > 0) {
-        selectInput(
-          "game_id",
-          label = NULL,
-          choices = SCHEDULE_CARD_CHOICES,
-          selected = DEFAULT_GAME,
-          width = "100%"
+      tabsetPanel(
+        tabPanel("Predictions",
+          h3("Over/Under Prediction"),
+          verbatimTextOutput("prediction_summary"),
+          actionButton("toggle_details", "See underlying statistics", class = "btn-default"),
+          br(),
+          br(),
+          tableOutput("prediction_table"),
+          hr(),
+          h3("Select Upcoming Game"),
+          if (length(SCHEDULE_CARD_CHOICES) > 0) {
+            selectInput(
+              "game_id",
+              label = NULL,
+              choices = SCHEDULE_CARD_CHOICES,
+              selected = DEFAULT_GAME,
+              width = "100%"
+            )
+          } else {
+            p("No upcoming scheduled games found in the current search window.")
+          }
+        ),
+        tabPanel("History",
+          h3("Recent Prediction History"),
+          p("Predictions are stored as you use the app and compared against actual results once games complete."),
+          uiOutput("history_record"),
+          tableOutput("history_table")
         )
-      } else {
-        p("No upcoming scheduled games found in the current search window.")
-      }
+      )
     )
   )
 )
 
 server <- function(input, output, session) {
   details_visible <- reactiveVal(FALSE)
+  prediction_log <- reactiveVal(read_prediction_log())
 
   observeEvent(input$toggle_details, {
     details_visible(!details_visible())
@@ -1339,6 +1395,39 @@ server <- function(input, output, session) {
     })
   })
 
+  # Log each prediction to disk the first time it's computed
+  observe({
+    res <- model_results()
+    if (!is.list(res) || is.null(res$lean)) return()
+
+    game <- selected_game()
+    if (is.null(game) || nrow(game) == 0) return()
+
+    current_log <- prediction_log()
+    game_id <- game$game_id[[1]]
+    if (game_id %in% current_log$game_id) return()
+
+    new_row <- data.frame(
+      game_id = game_id,
+      game_date = game$game_date[[1]],
+      home_team = game$home_team[[1]],
+      away_team = game$away_team[[1]],
+      vegas_total = res$vegas_total,
+      line_source = res$line_source,
+      expected_total = res$expected_total,
+      prob_over = res$prob_over,
+      prob_under = res$prob_under,
+      lean = res$lean,
+      prediction_label = res$prediction_label,
+      predicted_at = as.character(Sys.time()),
+      stringsAsFactors = FALSE
+    )
+
+    updated <- rbind(current_log, new_row)
+    save_prediction_log(updated)
+    prediction_log(updated)
+  })
+
   output$prediction_summary <- renderPrint({
     res <- model_results()
 
@@ -1365,6 +1454,76 @@ server <- function(input, output, session) {
     if (is.character(res)) return(NULL)
     res$details
   }, striped = TRUE, bordered = TRUE, hover = TRUE)
+
+  history_data <- reactive({
+    log <- prediction_log()
+    if (nrow(log) == 0) return(NULL)
+
+    # Join stored predictions with actual results from completed games
+    history <- log |>
+      dplyr::inner_join(
+        CACHED_HISTORICAL_DATA |> dplyr::select(game_id, home_goals, away_goals),
+        by = "game_id"
+      ) |>
+      dplyr::arrange(dplyr::desc(game_date)) |>
+      head(HISTORY_DISPLAY_COUNT)
+
+    if (nrow(history) == 0) return(NULL)
+
+    history |>
+      dplyr::mutate(
+        actual_total = home_goals + away_goals,
+        actual_result = dplyr::case_when(
+          actual_total > vegas_total ~ "OVER",
+          actual_total < vegas_total ~ "UNDER",
+          TRUE ~ "PUSH"
+        ),
+        hit = dplyr::case_when(
+          lean == "NO EDGE" ~ "\u2014",
+          lean == actual_result ~ "\u2713",
+          actual_result == "PUSH" ~ "Push",
+          TRUE ~ "\u2717"
+        )
+      ) |>
+      dplyr::transmute(
+        Date = format(game_date, "%m/%d"),
+        Matchup = paste(away_team, "at", home_team),
+        Line = vegas_total,
+        Pick = prediction_label,
+        Expected = round(expected_total, 1),
+        Actual = as.integer(actual_total),
+        Result = actual_result,
+        Hit = hit
+      )
+  })
+
+  output$history_table <- renderTable({
+    history_data()
+  }, striped = TRUE, bordered = TRUE, hover = TRUE)
+
+  output$history_record <- renderUI({
+    hd <- history_data()
+    if (is.null(hd) || nrow(hd) == 0) {
+      return(p("No completed games with stored predictions yet. Predictions are logged as you use the app."))
+    }
+
+    picks <- hd |> dplyr::filter(Hit != "\u2014")
+    if (nrow(picks) == 0) {
+      return(p("Model had no picks with sufficient edge in completed games."))
+    }
+
+    wins <- sum(picks$Hit == "\u2713")
+    losses <- sum(picks$Hit == "\u2717")
+    pushes <- sum(picks$Hit == "Push")
+
+    record_text <- paste0(
+      wins, "-", losses,
+      if (pushes > 0) paste0("-", pushes) else "",
+      " on ", nrow(picks), " pick", if (nrow(picks) != 1) "s" else ""
+    )
+
+    tags$p(tags$b("Record: "), record_text)
+  })
 }
 
 shinyApp(ui = ui, server = server)
